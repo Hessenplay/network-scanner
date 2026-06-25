@@ -27,61 +27,34 @@ from .db import ensure_scan_jobs_for_network, mongo, now, oid, subnet_chunks, to
 from .secrets import decrypt_secret_fields
 
 COMMON_VENDOR_PREFIXES = {
-    "00:1A:11": "Google",
-    "00:1B:63": "Apple",
-    "00:50:56": "VMware",
-    "08:00:27": "Oracle VirtualBox",
-    "3C:5A:B4": "Google",
-    "B8:27:EB": "Raspberry Pi",
-    "DC:A6:32": "Raspberry Pi",
-    "F4:92:BF": "Ubiquiti",
-    "24:5A:4C": "Ubiquiti",
-    "78:8A:20": "Ubiquiti",
-    "E0:63:DA": "Ubiquiti",
-    "FC:EC:DA": "Ubiquiti",
-    "A8:5E:45": "Ubiquiti",
-    "00:11:32": "Synology",
-    "00:08:9B": "ICP Electronics",
-    "00:0C:29": "VMware",
-    "00:05:69": "VMware",
-    "00:1C:42": "Parallels",
-    "F0:9F:C2": "Ubiquiti",
-    "D8:3A:DD": "Raspberry Pi",
-    "E4:5F:01": "Raspberry Pi",
-    "B8:27:EB": "Raspberry Pi",
-    "10:9A:DD": "Apple",
-    "28:CF:E9": "Apple",
-    "3C:07:54": "Apple",
-    "70:56:81": "Apple",
-    "A4:83:E7": "Apple",
-    "F0:18:98": "Apple",
-    "18:E8:29": "TP-Link",
-    "50:C7:BF": "TP-Link",
-    "B0:4E:26": "TP-Link",
-    "C0:25:E9": "TP-Link",
-    "48:A9:8A": "QNAP",
-    "00:08:9B": "QNAP",
-    "00:80:77": "Brother",
-    "30:05:5C": "Brother",
-    "00:1B:A9": "Brother",
-    "00:17:C8": "Kyocera",
-    "00:21:B7": "Lexmark",
-    "00:26:73": "Ricoh",
-    "00:1E:8F": "Canon",
-    "00:25:36": "Hikvision",
-    "C4:2F:90": "Hikvision",
-    "BC:AD:28": "Hikvision",
-    "3C:E3:6B": "Hikvision",
-    "90:02:A9": "Dahua",
-    "BC:32:5F": "Dahua",
+    "00:1A:11": "Google", "00:1B:63": "Apple", "00:50:56": "VMware",
+    "08:00:27": "Oracle VirtualBox", "3C:5A:B4": "Google", "B8:27:EB": "Raspberry Pi",
+    "DC:A6:32": "Raspberry Pi", "F4:92:BF": "Ubiquiti", "24:5A:4C": "Ubiquiti",
+    "78:8A:20": "Ubiquiti", "E0:63:DA": "Ubiquiti", "FC:EC:DA": "Ubiquiti",
+    "A8:5E:45": "Ubiquiti", "00:11:32": "Synology", "00:08:9B": "ICP Electronics",
+    "00:0C:29": "VMware", "00:05:69": "VMware", "00:1C:42": "Parallels",
+    "F0:9F:C2": "Ubiquiti", "D8:3A:DD": "Raspberry Pi", "E4:5F:01": "Raspberry Pi",
+    "10:9A:DD": "Apple", "28:CF:E9": "Apple", "3C:07:54": "Apple",
+    "70:56:81": "Apple", "A4:83:E7": "Apple", "F0:18:98": "Apple",
+    "18:E8:29": "TP-Link", "50:C7:BF": "TP-Link", "B0:4E:26": "TP-Link",
+    "C0:25:E9": "TP-Link", "48:A9:8A": "QNAP", "00:80:77": "Brother",
+    "30:05:5C": "Brother", "00:1B:A9": "Brother", "00:17:C8": "Kyocera",
+    "00:21:B7": "Lexmark", "00:26:73": "Ricoh", "00:1E:8F": "Canon",
+    "00:25:36": "Hikvision", "C4:2F:90": "Hikvision", "BC:AD:28": "Hikvision",
+    "3C:E3:6B": "Hikvision", "90:02:A9": "Dahua", "BC:32:5F": "Dahua",
     "04:CF:8C": "Dahua",
 }
+
 DISCOVERY_PORTS = [22, 80, 443, 445, 3389, 5000, 8080, 8443, 9100]
-
-
 HTTP_PORTS = {80, 8000, 8080, 8081, 8888, 9000, 9090, 10000}
 HTTPS_PORTS = {443, 5001, 8443, 9443}
 SSH_PORTS = {22}
+
+# --- Defaults (overridable per scan) ---
+DEFAULT_DISCOVERY_TIMEOUT_S = 12    # was 4 – many hosts need more time
+DEFAULT_TCP_PROBE_TIMEOUT_MS = 750  # was 350 – misses slow/overloaded hosts
+DEFAULT_RETRY_COUNT = 1             # was 0 – single retry catches transient drops
+DEFAULT_RATE_LIMIT = 600            # packets/min
 
 
 def is_usable_host_ip(ip: str) -> bool:
@@ -103,16 +76,9 @@ def is_generic_http_title(title: str | None) -> bool:
     value = (title or "").strip().lower()
     if not value:
         return True
-    generic_prefixes = (
-        "redirect to ",
-        "moved temporarily",
-        "moved permanently",
-        "document moved",
-        "302 found",
-        "301 moved",
-        "index of /",
-    )
-    return any(value.startswith(prefix) for prefix in generic_prefixes)
+    generic_prefixes = ("redirect to ", "moved temporarily", "moved permanently",
+                        "document moved", "302 found", "301 moved", "index of /")
+    return any(value.startswith(p) for p in generic_prefixes)
 
 
 def has_strong_http_evidence(service: dict[str, Any]) -> bool:
@@ -187,13 +153,9 @@ def fetch_http_fingerprint(ip: str, port: int, tls: bool = False) -> dict[str, A
         response = conn.getresponse()
         body = response.read(180_000)
         headers = {key.lower(): value for key, value in response.getheaders()}
-        result.update({
-            "status": response.status,
-            "server": headers.get("server"),
-            "content_type": headers.get("content-type"),
-            "title": extract_http_title(body),
-            "headers": headers,
-        })
+        result.update({"status": response.status, "server": headers.get("server"),
+                       "content_type": headers.get("content-type"),
+                       "title": extract_http_title(body), "headers": headers})
         conn.close()
     except Exception as exc:
         result["error"] = str(exc)[:180]
@@ -222,18 +184,11 @@ def fetch_tls_certificate(ip: str, port: int) -> dict[str, Any] | None:
         with ctx.wrap_socket(sock, server_hostname=ip) as tls_sock:
             der = tls_sock.getpeercert(binary_form=True)
             cert = tls_sock.getpeercert() or {}
-            result = {
-                "port": port,
-                "sha256": hashlib.sha256(der).hexdigest() if der else None,
-                "subject": cert.get("subject"),
-                "issuer": cert.get("issuer"),
-                "not_before": cert.get("notBefore"),
-                "not_after": cert.get("notAfter"),
-                "sans": cert.get("subjectAltName"),
-                "cipher": tls_sock.cipher(),
-                "version": tls_sock.version(),
-            }
-            return result
+            return {"port": port, "sha256": hashlib.sha256(der).hexdigest() if der else None,
+                    "subject": cert.get("subject"), "issuer": cert.get("issuer"),
+                    "not_before": cert.get("notBefore"), "not_after": cert.get("notAfter"),
+                    "sans": cert.get("subjectAltName"), "cipher": tls_sock.cipher(),
+                    "version": tls_sock.version()}
     except Exception:
         return None
     finally:
@@ -288,12 +243,8 @@ def netbios_name_query(ip: str) -> dict[str, Any] | None:
 
 def ssdp_discover(timeout: float = 2.0) -> dict[str, dict[str, Any]]:
     message = "\r\n".join([
-        "M-SEARCH * HTTP/1.1",
-        "HOST: 239.255.255.250:1900",
-        'MAN: "ssdp:discover"',
-        "MX: 1",
-        "ST: ssdp:all",
-        "", "",
+        "M-SEARCH * HTTP/1.1", "HOST: 239.255.255.250:1900",
+        'MAN: "ssdp:discover"', "MX: 1", "ST: ssdp:all", "", "",
     ]).encode()
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.settimeout(timeout)
@@ -321,9 +272,8 @@ def ssdp_discover(timeout: float = 2.0) -> dict[str, dict[str, Any]]:
 
 
 def mdns_discover(timeout: float = 2.0) -> dict[str, dict[str, Any]]:
-    # Lightweight passive/active mDNS probe. Full DNS-SD parsing can be layered on later;
-    # even source IPs and raw service packets add useful identity evidence.
-    query = b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00" + b"\x09_services\x07_dns-sd\x04_udp\x05local\x00\x00\x0c\x00\x01"
+    query = b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00" + \
+            b"\x09_services\x07_dns-sd\x04_udp\x05local\x00\x00\x0c\x00\x01"
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.settimeout(timeout)
     found: dict[str, dict[str, Any]] = {}
@@ -337,7 +287,10 @@ def mdns_discover(timeout: float = 2.0) -> dict[str, dict[str, Any]]:
             except socket.timeout:
                 break
             strings = re.findall(rb"[A-Za-z0-9_. -]{4,}", data)
-            found[addr[0]] = {"strings": sorted({item.decode('utf-8', errors='ignore')[:120] for item in strings})[:40], "bytes": len(data)}
+            found[addr[0]] = {
+                "strings": sorted({item.decode("utf-8", errors="ignore")[:120] for item in strings})[:40],
+                "bytes": len(data),
+            }
     except Exception:
         pass
     finally:
@@ -349,9 +302,7 @@ def enrich_device_item(item: dict[str, Any]) -> dict[str, Any]:
     ip = item["ip"]
     services = item.get("services") or []
     fingerprints: dict[str, Any] = {}
-    http_results = []
-    tls_results = []
-    ssh_results = []
+    http_results, tls_results, ssh_results = [], [], []
     for service in services:
         port = int(service.get("port") or 0)
         service_name = str(service.get("service_name") or "").lower()
@@ -406,21 +357,14 @@ def enrich_device_item(item: dict[str, Any]) -> dict[str, Any]:
 def service_text(services: list[dict[str, Any]], hostname: str | None = None) -> str:
     parts = [hostname or ""]
     for service in services:
-        parts.extend([
-            str(service.get("service_name") or ""),
-            str(service.get("product") or ""),
-            str(service.get("version") or ""),
-            str(service.get("banner") or ""),
-        ])
+        parts.extend([str(service.get("service_name") or ""), str(service.get("product") or ""),
+                      str(service.get("version") or ""), str(service.get("banner") or "")])
         http_info = service.get("http") or {}
         tls_info = service.get("tls") or {}
         ssh_info = service.get("ssh") or {}
-        parts.extend([
-            str(http_info.get("title") or ""),
-            str(http_info.get("server") or ""),
-            str(ssh_info.get("banner") or ""),
-            json.dumps(tls_info.get("subject") or "", default=str),
-        ])
+        parts.extend([str(http_info.get("title") or ""), str(http_info.get("server") or ""),
+                      str(ssh_info.get("banner") or ""),
+                      json.dumps(tls_info.get("subject") or "", default=str)])
     return " ".join(parts).lower()
 
 
@@ -428,36 +372,35 @@ def classify_device(services: list[dict[str, Any]], hostname: str | None) -> str
     ports = {int(s.get("port", 0)) for s in services}
     text = service_text(services, hostname)
     host = (hostname or "").lower()
-
-    if {9100, 515, 631} & ports or any(word in text for word in ["printer", "ipp", "jetdirect", "brother", "kyocera", "ricoh", "lexmark", "canon"]):
+    if {9100, 515, 631} & ports or any(w in text for w in ["printer", "ipp", "jetdirect", "brother", "kyocera", "ricoh", "lexmark", "canon"]):
         return "printer"
-    if {554, 8554} & ports or any(word in text for word in ["rtsp", "hikvision", "dahua", "axis", "camera", "ip cam"]):
+    if {554, 8554} & ports or any(w in text for w in ["rtsp", "hikvision", "dahua", "axis", "camera", "ip cam"]):
         return "camera"
-    if any(word in text for word in ["sma ", "sunny webbox", "power reducer", "webbox-20", "solar", "inverter"]):
+    if any(w in text for w in ["sma ", "sunny webbox", "power reducer", "webbox-20", "solar", "inverter"]):
         return "energy-device"
     if {161, 162} & ports:
         return "network-device"
-    if any(word in text for word in ["unifi", "ubiquiti", "mikrotik", "routeros", "openwrt", "dd-wrt", "pfsense", "opnsense", "fortinet", "sophos", "fritz!box", "fritzbox"]):
+    if any(w in text for w in ["unifi", "ubiquiti", "mikrotik", "routeros", "openwrt", "dd-wrt", "pfsense", "opnsense", "fortinet", "sophos", "fritz!box", "fritzbox"]):
         if "unifi ap" in text or "access point" in text or "airmax" in text:
             return "access-point"
         if "switch" in text:
             return "switch"
         return "router-firewall"
-    if any(word in text for word in ["mocana", "nanoss", "ehhttp", "ehttp", "embedded", "web managed", "managed switch", "smart switch"]):
+    if any(w in text for w in ["mocana", "nanoss", "ehhttp", "ehttp", "embedded", "web managed", "managed switch", "smart switch"]):
         if 23 in ports or {22, 80, 443}.issubset(ports):
             return "switch"
         return "network-device"
     if 23 in ports and ({80, 443, 22} & ports):
         return "network-device"
-    if any(word in text for word in ["synology", "qnap", "truenas", "freenas", "nas "]):
+    if any(w in text for w in ["synology", "qnap", "truenas", "freenas", "nas "]):
         return "nas"
-    if any(word in text for word in ["proxmox", "vmware esxi", "esxi", "xenserver", "hyper-v"]):
+    if any(w in text for w in ["proxmox", "vmware esxi", "esxi", "xenserver", "hyper-v"]):
         return "hypervisor"
     if {445, 3389, 5985, 5986} & ports or "microsoft-ds" in text:
         return "windows-host"
     if {3306, 5432, 6379, 9200, 9300, 27017, 1433, 1521} & ports:
         return "database"
-    if any(word in text for word in ["home assistant", "grafana", "prometheus", "kubernetes", "docker", "portainer", "nginx", "apache", "openssh", "debian", "ubuntu", "centos", "rocky linux"]):
+    if any(w in text for w in ["home assistant", "grafana", "prometheus", "kubernetes", "docker", "portainer", "nginx", "apache", "openssh", "debian", "ubuntu", "centos", "rocky linux"]):
         if {22, 80, 443, 3000, 5000, 8000, 8080, 8443, 9000, 9090} & ports:
             return "server"
     if (ports <= {80, 443, 8080, 8443, 8000, 8081, 8888, 9000, 9090, 10000}) and ports:
@@ -467,6 +410,7 @@ def classify_device(services: list[dict[str, Any]], hostname: str | None) -> str
     if "cam" in host:
         return "camera"
     return "unknown"
+
 
 def normalize_mac(mac: str | None) -> str | None:
     if not mac:
@@ -501,28 +445,31 @@ def _run_nmap_args(args: list[str], timeout: int) -> str:
     return completed.stdout if completed.stdout.strip() else ""
 
 
-
-def tcp_probe_host(ip: str, ports: list[int], timeout: float = 0.35) -> dict[str, Any] | None:
+def tcp_probe_host(ip: str, ports: list[int], timeout: float | None = None) -> dict[str, Any] | None:
+    """Connect-based host probe. timeout_s defaults to DEFAULT_TCP_PROBE_TIMEOUT_MS/1000."""
+    t = timeout if timeout is not None else DEFAULT_TCP_PROBE_TIMEOUT_MS / 1000
     open_services = []
     for port in ports:
-        sock = safe_socket_connect(ip, port, timeout=timeout)
+        sock = safe_socket_connect(ip, port, timeout=t)
         if sock:
             try:
                 sock.close()
             except Exception:
                 pass
-            open_services.append({"port": port, "protocol": "tcp", "state": "open", "service_name": None, "product": None, "version": None, "banner": None})
+            open_services.append({"port": port, "protocol": "tcp", "state": "open",
+                                   "service_name": None, "product": None, "version": None, "banner": None})
     if open_services:
         return {"ip": ip, "services": open_services, "category": classify_device(open_services, None), "raw_source": "tcp-probe"}
     return None
 
 
-def run_fast_tcp_discovery(cidr: str) -> list[dict[str, Any]]:
+def run_fast_tcp_discovery(cidr: str, timeout_ms: int | None = None) -> list[dict[str, Any]]:
+    t = (timeout_ms if timeout_ms is not None else DEFAULT_TCP_PROBE_TIMEOUT_MS) / 1000
     hosts = hosts_for_cidr(cidr)
     results: list[dict[str, Any]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=128) as executor:
-        futures = [executor.submit(tcp_probe_host, ip, DISCOVERY_PORTS) for ip in hosts]
-        for future in concurrent.futures.as_completed(futures, timeout=45):
+        futures = [executor.submit(tcp_probe_host, ip, DISCOVERY_PORTS, t) for ip in hosts]
+        for future in concurrent.futures.as_completed(futures, timeout=60):
             try:
                 item = future.result()
             except Exception:
@@ -531,60 +478,64 @@ def run_fast_tcp_discovery(cidr: str) -> list[dict[str, Any]]:
                 results.append(item)
     return results
 
-def run_ping_discovery(cidr: str) -> list[dict[str, Any]]:
-    probe_ports = ",".join(str(port) for port in DISCOVERY_PORTS)
+
+def run_ping_discovery(
+    cidr: str,
+    host_timeout_s: int | None = None,
+    rtt_timeout_ms: int | None = None,
+    nmap_retries: int | None = None,
+    tcp_timeout_ms: int | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Two-phase discovery:
+      1. nmap ping sweep (ARP + ICMP + TCP SYN on common ports)
+      2. fallback to parallel TCP connect probe if nmap finds nothing or fails
+    """
+    host_t = host_timeout_s if host_timeout_s is not None else DEFAULT_DISCOVERY_TIMEOUT_S
+    rtt_t = rtt_timeout_ms if rtt_timeout_ms is not None else 800
+    retries = nmap_retries if nmap_retries is not None else DEFAULT_RETRY_COUNT
+    probe_ports = ",".join(str(p) for p in DISCOVERY_PORTS)
     args = [
-        "nmap",
-        "-sn",
-        "-n",
-        "--max-retries",
-        "0",
-        "--host-timeout",
-        "4s",
-        "--initial-rtt-timeout",
-        "100ms",
-        "--max-rtt-timeout",
-        "500ms",
-        "--min-parallelism",
-        "64",
-        "-PE",
-        f"-PS{probe_ports}",
-        f"-PA{probe_ports}",
-        "-oX",
-        "-",
+        "nmap", "-sn", "-n",
+        "--max-retries", str(retries),
+        "--host-timeout", f"{host_t}s",
+        "--initial-rtt-timeout", "200ms",
+        "--max-rtt-timeout", f"{rtt_t}ms",
+        "--min-parallelism", "32",
+        "--max-parallelism", "256",
+        "-PE", f"-PS{probe_ports}", f"-PA{probe_ports}",
+        "-oX", "-",
         cidr,
     ]
     try:
-        xml = _run_nmap_args(args, 25)
+        xml = _run_nmap_args(args, host_t * 4 + 30)
         results = parse_nmap_xml(xml) if xml else []
     except Exception:
         results = []
+
     if results:
         return results
-    return run_fast_tcp_discovery(cidr)
+    # nmap found nothing or failed – fall back to raw TCP probe
+    return run_fast_tcp_discovery(cidr, tcp_timeout_ms)
 
 
-def run_port_scan(hosts: list[str], ports: list[int], service_detection: bool) -> list[dict[str, Any]]:
+def run_port_scan(hosts: list[str], ports: list[int], service_detection: bool,
+                  host_timeout_s: int | None = None) -> list[dict[str, Any]]:
     if not hosts:
         return []
+    t = host_timeout_s if host_timeout_s is not None else settings.scan_timeout_seconds
     args = [
-        "nmap",
-        "-oX",
-        "-",
-        "-n",
-        "--max-retries",
-        "1",
-        "--host-timeout",
-        f"{settings.scan_timeout_seconds}s",
-        "-p",
-        ",".join(str(p) for p in ports),
+        "nmap", "-oX", "-", "-n",
+        "--max-retries", "1",
+        "--host-timeout", f"{t}s",
+        "-p", ",".join(str(p) for p in ports),
     ]
     if service_detection:
         args.extend(["-sT", "-sV", "--version-light"])
     else:
         args.extend(["-sT"])
     args.extend(hosts)
-    xml = _run_nmap_args(args, max(settings.scan_timeout_seconds * 3, 240))
+    xml = _run_nmap_args(args, max(t * len(hosts) + 60, 300))
     return parse_nmap_xml(xml) if xml else []
 
 
@@ -595,24 +546,21 @@ def parse_nmap_xml(xml_text: str) -> list[dict[str, Any]]:
         status = host.find("status")
         if status is not None and status.attrib.get("state") != "up":
             continue
-        ip = None
-        mac = None
-        vendor = None
+        ip = mac = vendor = hostname = None
         for address in host.findall("address"):
             if address.attrib.get("addrtype") == "ipv4":
                 ip = address.attrib.get("addr")
             if address.attrib.get("addrtype") == "mac":
                 mac = normalize_mac(address.attrib.get("addr"))
                 vendor = address.attrib.get("vendor")
-        hostnames = host.find("hostnames")
-        hostname = None
-        if hostnames is not None:
-            first = hostnames.find("hostname")
+        hostnames_el = host.find("hostnames")
+        if hostnames_el is not None:
+            first = hostnames_el.find("hostname")
             hostname = first.attrib.get("name") if first is not None else None
         services = []
-        ports = host.find("ports")
-        if ports is not None:
-            for port in ports.findall("port"):
+        ports_el = host.find("ports")
+        if ports_el is not None:
+            for port in ports_el.findall("port"):
                 state = port.find("state")
                 if state is None or state.attrib.get("state") != "open":
                     continue
@@ -632,11 +580,8 @@ def parse_nmap_xml(xml_text: str) -> list[dict[str, Any]]:
             if vendor:
                 detected_vendor, confidence = vendor, 60
             results.append({
-                "ip": ip,
-                "mac": mac,
-                "hostname": hostname,
-                "detected_vendor": detected_vendor,
-                "vendor_confidence": confidence,
+                "ip": ip, "mac": mac, "hostname": hostname,
+                "detected_vendor": detected_vendor, "vendor_confidence": confidence,
                 "services": services,
                 "category": classify_device(services, hostname),
                 "raw_source": "nmap",
@@ -664,17 +609,16 @@ def merge_results(*groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def fingerprint_for(item: dict[str, Any]) -> str | None:
-    # Fingerprints are useful as supporting identity evidence, but generic open-port
-    # shapes are too weak to merge devices. Require a hostname or specific banner data.
     parts = []
     if item.get("hostname"):
         parts.append(str(item["hostname"]).lower())
     for service in item.get("services") or []:
-        specific = " ".join(str(service.get(key) or "") for key in ("product", "version", "banner")).strip()
+        specific = " ".join(str(service.get(k) or "") for k in ("product", "version", "banner")).strip()
         http_info = service.get("http") or {}
         tls_info = service.get("tls") or {}
         ssh_info = service.get("ssh") or {}
-        specific = " ".join(filter(None, [specific, http_info.get("title"), http_info.get("server"), http_info.get("favicon_sha256"), tls_info.get("sha256"), ssh_info.get("sha256")])).strip()
+        specific = " ".join(filter(None, [specific, http_info.get("title"), http_info.get("server"),
+                                           http_info.get("favicon_sha256"), tls_info.get("sha256"), ssh_info.get("sha256")])).strip()
         if specific:
             parts.append(f"{service.get('protocol','tcp')}:{service.get('port')}:{service.get('service_name') or ''}:{specific}".lower())
     for group in (item.get("fingerprints") or {}).values():
@@ -727,9 +671,7 @@ def search_text_for(doc: dict[str, Any]) -> str:
     overrides = doc.get("overrides") or {}
     identifiers = doc.get("identifiers") or {}
     parts = [
-        doc.get("device_id"),
-        doc.get("display_name"),
-        doc.get("category"),
+        doc.get("device_id"), doc.get("display_name"), doc.get("category"),
         detected.get("vendor"), detected.get("model"), detected.get("os"),
         overrides.get("vendor"), overrides.get("model"),
         identifiers.get("mac"),
@@ -738,13 +680,13 @@ def search_text_for(doc: dict[str, Any]) -> str:
         " ".join(doc.get("tags") or []),
     ]
     for service in doc.get("services") or []:
-        parts.extend([str(service.get("port") or ""), service.get("service_name"), service.get("product"), service.get("version"), service.get("banner")])
+        parts.extend([str(service.get("port") or ""), service.get("service_name"),
+                      service.get("product"), service.get("version"), service.get("banner")])
         parts.append(json.dumps(service.get("http") or {}, sort_keys=True, default=str))
         parts.append(json.dumps(service.get("tls") or {}, sort_keys=True, default=str))
         parts.append(json.dumps(service.get("ssh") or {}, sort_keys=True, default=str))
     parts.append(json.dumps(doc.get("fingerprints") or {}, sort_keys=True, default=str))
     return " ".join(str(part) for part in parts if part).lower()
-
 
 
 def upsert_defensive_findings(device_id: str, item: dict[str, Any]) -> None:
@@ -767,17 +709,22 @@ def upsert_defensive_findings(device_id: str, item: dict[str, Any]) -> None:
             key = f"{device_id}:port:{port}:exposed"
             db.findings.update_one(
                 {"finding_key": key},
-                {"$set": {"device_id": device_id, "title": title, "severity": severity, "status": "open", "source": "scanner", "evidence": service, "last_seen_at": now(), "updated_at": now()}, "$setOnInsert": {"finding_key": key, "created_at": now()}},
+                {"$set": {"device_id": device_id, "title": title, "severity": severity, "status": "open",
+                           "source": "scanner", "evidence": service, "last_seen_at": now(), "updated_at": now()},
+                 "$setOnInsert": {"finding_key": key, "created_at": now()}},
                 upsert=True,
             )
         http_info = service.get("http") or {}
         if http_info.get("title") or http_info.get("server"):
             title_text = " ".join(str(http_info.get(k) or "") for k in ("title", "server")).lower()
-            if any(word in title_text for word in ["login", "admin", "router", "nas", "camera", "ubiquiti", "mikrotik", "openwrt", "proxmox"]):
+            if any(w in title_text for w in ["login", "admin", "router", "nas", "camera", "ubiquiti", "mikrotik", "openwrt", "proxmox"]):
                 key = f"{device_id}:port:{port}:admin-http"
                 db.findings.update_one(
                     {"finding_key": key},
-                    {"$set": {"device_id": device_id, "title": "Administrative web interface detected", "severity": "info", "status": "open", "source": "scanner", "evidence": http_info, "last_seen_at": now(), "updated_at": now()}, "$setOnInsert": {"finding_key": key, "created_at": now()}},
+                    {"$set": {"device_id": device_id, "title": "Administrative web interface detected",
+                               "severity": "info", "status": "open", "source": "scanner",
+                               "evidence": http_info, "last_seen_at": now(), "updated_at": now()},
+                     "$setOnInsert": {"finding_key": key, "created_at": now()}},
                     upsert=True,
                 )
 
@@ -800,15 +747,11 @@ def upsert_device(item: dict[str, Any], scan_run_id: str | None, network_id: str
             "display_name": hostname or item.get("ip"),
             "category": item.get("category") or (existing or {}).get("category") or "unknown",
             "fingerprints": item.get("fingerprints") or (existing or {}).get("fingerprints") or {},
-            "last_seen_at": now(),
-            "is_present": True,
-            "updated_at": now(),
+            "last_seen_at": now(), "is_present": True, "updated_at": now(),
         },
         "$setOnInsert": {
-            "first_seen_at": now(),
-            "created_at": now(),
-            "tags": [],
-            "notes": None,
+            "first_seen_at": now(), "created_at": now(),
+            "tags": [], "notes": None,
             "overrides": {"vendor": None, "model": None},
             "identity_sources": [],
         },
@@ -832,7 +775,6 @@ def upsert_device(item: dict[str, Any], scan_run_id: str | None, network_id: str
     doc = db.devices.find_one_and_update({"device_id": device_id}, update, upsert=True, return_document=ReturnDocument.AFTER)
     doc["search_text"] = search_text_for(doc)
     db.devices.update_one({"_id": doc["_id"]}, {"$set": {"search_text": doc["search_text"]}})
-
     event_types = ["device_seen"]
     if not existing:
         event_types.append("device_first_seen")
@@ -841,25 +783,16 @@ def upsert_device(item: dict[str, Any], scan_run_id: str | None, network_id: str
     if old_ports != new_ports:
         event_types.append("ports_changed")
     db.observations.insert_one({
-        "device_id": device_id,
-        "scan_run_id": scan_run_id,
-        "network_id": network_id,
-        "type": "scan_observation",
-        "events": event_types,
-        "ip": item.get("ip"),
-        "mac": mac,
-        "hostname": hostname,
+        "device_id": device_id, "scan_run_id": scan_run_id, "network_id": network_id,
+        "type": "scan_observation", "events": event_types,
+        "ip": item.get("ip"), "mac": mac, "hostname": hostname,
         "services": item.get("services") or [],
         "detected": {"vendor": vendor, "model": item.get("detected_model"), "os": item.get("detected_os"), "confidence": confidence},
-        "fingerprints": item.get("fingerprints") or {},
-        "raw": item,
-        "source": source,
-        "observed_at": now(),
-        "created_at": now(),
+        "fingerprints": item.get("fingerprints") or {}, "raw": item,
+        "source": source, "observed_at": now(), "created_at": now(),
     })
     upsert_defensive_findings(device_id, item)
     return device_id
-
 
 
 def parse_local_arp(path: str = "/proc/net/arp") -> list[dict[str, Any]]:
@@ -871,7 +804,8 @@ def parse_local_arp(path: str = "/proc/net/arp") -> list[dict[str, Any]]:
     for line in lines:
         parts = line.split()
         if len(parts) >= 4 and parts[3] != "00:00:00:00:00:00":
-            rows.append({"ip": parts[0], "mac": normalize_mac(parts[3]), "source_detail": {"device": parts[5] if len(parts) > 5 else None}})
+            rows.append({"ip": parts[0], "mac": normalize_mac(parts[3]),
+                         "source_detail": {"device": parts[5] if len(parts) > 5 else None}})
     return rows
 
 
@@ -887,7 +821,9 @@ def parse_dhcp_leases(path: str) -> list[dict[str, Any]]:
             continue
         parts = line.split()
         if len(parts) >= 4 and re.match(r"^[0-9a-fA-F:.-]{11,17}$", parts[1]) and re.match(r"^\d+\.\d+\.\d+\.\d+$", parts[2]):
-            rows.append({"ip": parts[2], "mac": normalize_mac(parts[1]), "hostname": None if parts[3] == "*" else parts[3], "source_detail": {"lease": parts[0]}})
+            rows.append({"ip": parts[2], "mac": normalize_mac(parts[1]),
+                         "hostname": None if parts[3] == "*" else parts[3],
+                         "source_detail": {"lease": parts[0]}})
             continue
         host_match = re.search(r"hardware ethernet\s+([0-9a-fA-F:.-]+);", line)
         if host_match:
@@ -907,13 +843,20 @@ def parse_inventory_file(path: str) -> list[dict[str, Any]]:
         return [item for item in data if isinstance(item, dict)]
     rows = []
     for row in csv.DictReader(raw.splitlines()):
-        rows.append({"ip": row.get("ip") or row.get("address"), "mac": normalize_mac(row.get("mac") or row.get("mac_address")), "hostname": row.get("hostname") or row.get("name"), "detected_vendor": row.get("vendor"), "detected_model": row.get("model"), "source_detail": row})
+        rows.append({"ip": row.get("ip") or row.get("address"),
+                     "mac": normalize_mac(row.get("mac") or row.get("mac_address")),
+                     "hostname": row.get("hostname") or row.get("name"),
+                     "detected_vendor": row.get("vendor"), "detected_model": row.get("model"),
+                     "source_detail": row})
     return rows
 
 
 def run_snmpwalk(host: str, community: str, oid_text: str, timeout: int = 5) -> str | None:
     try:
-        completed = subprocess.run(["snmpwalk", "-v2c", "-c", community, "-t", str(timeout), "-r", "1", host, oid_text], capture_output=True, text=True, timeout=timeout + 3, check=False)
+        completed = subprocess.run(
+            ["snmpwalk", "-v2c", "-c", community, "-t", str(timeout), "-r", "1", host, oid_text],
+            capture_output=True, text=True, timeout=timeout + 3, check=False,
+        )
         return completed.stdout.strip() if completed.returncode == 0 and completed.stdout.strip() else None
     except Exception:
         return None
@@ -922,7 +865,9 @@ def run_snmpwalk(host: str, community: str, oid_text: str, timeout: int = 5) -> 
 def parse_snmp_system(host: str, community: str) -> list[dict[str, Any]]:
     sys_descr = run_snmpwalk(host, community, "1.3.6.1.2.1.1.1.0")
     sys_name = run_snmpwalk(host, community, "1.3.6.1.2.1.1.5.0")
-    result = {"ip": host, "hostname": None, "fingerprints": {"snmp": {"sysDescr": sys_descr, "sysName": sys_name}}, "source_detail": {"host": host}}
+    result: dict[str, Any] = {"ip": host, "hostname": None,
+                               "fingerprints": {"snmp": {"sysDescr": sys_descr, "sysName": sys_name}},
+                               "source_detail": {"host": host}}
     if sys_name:
         result["hostname"] = sys_name.split("=", 1)[-1].replace("STRING:", "").strip().strip('"')[:120]
     if sys_descr:
@@ -965,16 +910,23 @@ def sync_identity_source(source: dict[str, Any]) -> dict[str, Any]:
         if not row.get("ip") and not row.get("mac") and not row.get("hostname"):
             continue
         if not row.get("ip"):
-            row["ip"] = "source-only:" + (row.get("mac") or row.get("hostname") or hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()[:12])
+            row["ip"] = "source-only:" + (row.get("mac") or row.get("hostname") or
+                                           hashlib.sha256(json.dumps(row, sort_keys=True, default=str).encode()).hexdigest()[:12])
         row.setdefault("services", [])
         row.setdefault("category", row.get("category") or "unknown")
         upsert_device(row, None, None, source=f"identity:{source_type}")
         imported += 1
-    mongo().identity_sources.update_one({"_id": source["_id"]}, {"$set": {"last_sync_at": now(), "last_sync_result": {"imported": imported, "seen": len(rows)}, "updated_at": now()}})
+    mongo().identity_sources.update_one(
+        {"_id": source["_id"]},
+        {"$set": {"last_sync_at": now(), "last_sync_result": {"imported": imported, "seen": len(rows)}, "updated_at": now()}},
+    )
     return {"imported": imported, "seen": len(rows)}
 
 
-def create_scan_run(mode: str, network_id: str | None = None, profile_id: str | None = None, requested_by_type: str = "system", requested_by_id: str | None = None, cidr: str | None = None, job_id: str | None = None) -> str:
+def create_scan_run(mode: str, network_id: str | None = None, profile_id: str | None = None,
+                    requested_by_type: str = "system", requested_by_id: str | None = None,
+                    cidr: str | None = None, job_id: str | None = None,
+                    options: dict[str, Any] | None = None) -> str:
     target_label = cidr
     if not target_label and network_id:
         try:
@@ -990,23 +942,20 @@ def create_scan_run(mode: str, network_id: str | None = None, profile_id: str | 
         "network_id": str(network_id) if network_id else None,
         "profile_id": str(profile_id) if profile_id else None,
         "job_id": str(job_id) if job_id else None,
-        "cidr": cidr,
-        "target_label": target_label,
+        "cidr": cidr, "target_label": target_label,
         "requested_by_type": requested_by_type,
         "requested_by_id": str(requested_by_id) if requested_by_id else None,
-        "status": "queued",
-        "progress": 0,
-        "message": None,
-        "logs": [],
-        "created_at": now(),
-        "started_at": None,
-        "finished_at": None,
+        "status": "queued", "progress": 0, "message": None, "logs": [],
+        "options": options or {},
+        "created_at": now(), "started_at": None, "finished_at": None,
     })
     return str(result.inserted_id)
 
 
-def update_scan_run(scan_run_id: str, status: str, progress: int, message: str | None = None, logs: list[str] | None = None) -> None:
-    updates: dict[str, Any] = {"status": status, "progress": progress, "message": message, "logs": logs or [], "updated_at": now()}
+def update_scan_run(scan_run_id: str, status: str, progress: int,
+                    message: str | None = None, logs: list[str] | None = None) -> None:
+    updates: dict[str, Any] = {"status": status, "progress": progress,
+                                "message": message, "logs": logs or [], "updated_at": now()}
     row = mongo().scan_runs.find_one({"_id": oid(scan_run_id)}, {"started_at": 1})
     if status == "running" and row and not row.get("started_at"):
         updates["started_at"] = now()
@@ -1033,9 +982,6 @@ async def wait_if_paused_or_cancelled(scan_run_id: str, logs: list[str]) -> bool
 
 
 def due_jobs(limit: int) -> list[dict[str, Any]]:
-    # Fair sweep: finish never-scanned /24 chunks before revisiting active ones.
-    # A separate enrichment/deep-scan policy can prioritize busy subnets later;
-    # discovery itself must not starve higher-order chunks in a /16.
     return list(
         mongo().scan_jobs.find({"kind": "discovery", "next_due_at": {"$lte": now()}, "status": {"$ne": "running"}})
         .sort([("last_finished_at", 1), ("order", 1), ("next_due_at", 1)])
@@ -1047,15 +993,38 @@ def recover_stale_jobs() -> int:
     stale_before = now() - timedelta(seconds=settings.discovery_job_lease_seconds)
     result = mongo().scan_jobs.update_many(
         {"kind": "discovery", "status": "running", "updated_at": {"$lt": stale_before}},
-        {"$set": {"status": "queued", "progress": 0, "message": "Lease expired; queued again", "current_scan_id": None, "next_due_at": now(), "updated_at": now()}},
+        {"$set": {"status": "queued", "progress": 0, "message": "Lease expired; queued again",
+                  "current_scan_id": None, "next_due_at": now(), "updated_at": now()}},
     )
     return int(result.modified_count)
+
+
+def reset_failed_scan_jobs() -> int:
+    """Reset all failed scan jobs so they will be retried on next scheduler tick."""
+    result = mongo().scan_jobs.update_many(
+        {"kind": "discovery", "status": "failed"},
+        {"$set": {"status": "queued", "progress": 0, "message": "Reset by user request",
+                  "current_scan_id": None, "next_due_at": now(), "updated_at": now(), "last_error": None}},
+    )
+    return int(result.modified_count)
+
+
+def reset_single_scan_job(job_id: str) -> dict[str, Any] | None:
+    """Reset a single job to queued so it runs on next scheduler tick."""
+    mongo().scan_jobs.update_one(
+        {"_id": oid(job_id)},
+        {"$set": {"status": "queued", "progress": 0, "message": "Reset by user request",
+                  "current_scan_id": None, "next_due_at": now(), "updated_at": now(), "last_error": None}},
+    )
+    return mongo().scan_jobs.find_one({"_id": oid(job_id)})
 
 
 def reserve_job(job: dict[str, Any]) -> dict[str, Any] | None:
     return mongo().scan_jobs.find_one_and_update(
         {"_id": job["_id"], "kind": "discovery", "status": {"$ne": "running"}, "next_due_at": {"$lte": now()}},
-        {"$set": {"status": "running", "progress": 0, "message": "Queued by scheduler", "last_started_at": now(), "updated_at": now(), "next_due_at": now() + timedelta(seconds=settings.discovery_job_lease_seconds)}},
+        {"$set": {"status": "running", "progress": 0, "message": "Queued by scheduler",
+                  "last_started_at": now(), "updated_at": now(),
+                  "next_due_at": now() + timedelta(seconds=settings.discovery_job_lease_seconds)}},
         return_document=ReturnDocument.AFTER,
     )
 
@@ -1067,14 +1036,36 @@ def update_scan_job(job_id: str | None, **fields: Any) -> None:
     mongo().scan_jobs.update_one({"_id": oid(job_id)}, {"$set": fields})
 
 
-async def run_scan(scan_run_id: str, network_id: str | None, mode: str, cidr: str | None = None, job_id: str | None = None) -> None:
+async def run_scan(
+    scan_run_id: str,
+    network_id: str | None,
+    mode: str,
+    cidr: str | None = None,
+    job_id: str | None = None,
+    options: dict[str, Any] | None = None,
+) -> None:
+    """
+    Execute a scan run with configurable options.
+
+    options keys (all optional):
+      discovery_timeout_s  – nmap per-host timeout (default 12)
+      tcp_timeout_ms       – fallback TCP probe timeout (default 750)
+      retry_count          – times to retry a failed subnet (default 1)
+      rate_limit           – nmap rate limit / min (not yet plumbed into nmap args, reserved)
+    """
+    opts = options or {}
+    discovery_timeout_s = int(opts.get("discovery_timeout_s") or DEFAULT_DISCOVERY_TIMEOUT_S)
+    tcp_timeout_ms = int(opts.get("tcp_timeout_ms") or DEFAULT_TCP_PROBE_TIMEOUT_MS)
+    retry_count = int(opts.get("retry_count") if opts.get("retry_count") is not None else DEFAULT_RETRY_COUNT)
+
     logs: list[str] = []
     result_count = 0
     final_status = "running"
     final_message = "Starting scan"
     try:
         update_scan_run(scan_run_id, "running", 1, "Starting scan", logs)
-        update_scan_job(job_id, status="running", current_scan_id=scan_run_id, progress=1, message="Starting scan", started_at=now())
+        update_scan_job(job_id, status="running", current_scan_id=scan_run_id, progress=1,
+                        message="Starting scan", started_at=now())
         db = mongo()
         if network_id:
             network = db.networks.find_one({"_id": oid(network_id)})
@@ -1082,6 +1073,8 @@ async def run_scan(scan_run_id: str, network_id: str | None, mode: str, cidr: st
         else:
             networks = list(db.networks.find({"is_active": True}).sort("created_at", 1))
         ports = ports_for_default_profile()
+
+        # Ambient discovery (SSDP/mDNS)
         ambient_results: dict[str, dict[str, Any]] = {}
         if mode in {"discovery", "service", "deep"}:
             ssdp = await asyncio.to_thread(ssdp_discover, 1.5)
@@ -1090,30 +1083,63 @@ async def run_scan(scan_run_id: str, network_id: str | None, mode: str, cidr: st
                 ambient_results.setdefault(ip, {"ip": ip, "services": [], "fingerprints": {}})["fingerprints"]["ssdp"] = data
             for ip, data in mdns.items():
                 ambient_results.setdefault(ip, {"ip": ip, "services": [], "fingerprints": {}})["fingerprints"]["mdns"] = data
+
         targets: list[tuple[dict[str, Any], str]] = []
         for network in networks:
             if not network:
                 continue
             chunks = [cidr] if cidr else subnet_chunks(network["cidr"])
             targets.extend((network, chunk) for chunk in chunks if chunk)
+
         if not targets:
             raise RuntimeError("No active network targets found")
+
         for index, (network, target_cidr) in enumerate(targets):
             if not await wait_if_paused_or_cancelled(scan_run_id, logs):
                 return
+
             host_count = ipaddress.ip_network(target_cidr, strict=False).num_addresses
-            logs.append(f"Scanning {target_cidr} ({host_count} addresses)")
+            logs.append(f"Scanning {target_cidr} ({host_count} addresses, timeout={discovery_timeout_s}s, retry={retry_count})")
             progress = min(95, int((index / max(len(targets), 1)) * 90) + 5)
             update_scan_run(scan_run_id, "running", progress, logs[-1], logs)
             update_scan_job(job_id, status="running", current_scan_id=scan_run_id, progress=progress, message=logs[-1])
-            ping_results = await asyncio.to_thread(run_ping_discovery, target_cidr) if mode in {"discovery", "service", "deep"} else []
+
+            # Retry loop for this subnet
+            ping_results: list[dict[str, Any]] = []
+            last_exc: Exception | None = None
+            for attempt in range(retry_count + 1):
+                try:
+                    if mode in {"discovery", "service", "deep"}:
+                        ping_results = await asyncio.to_thread(
+                            run_ping_discovery, target_cidr,
+                            discovery_timeout_s, None, None, tcp_timeout_ms
+                        )
+                    if ping_results:
+                        if attempt > 0:
+                            logs.append(f"{target_cidr}: succeeded on attempt {attempt + 1}")
+                        break
+                    elif attempt < retry_count:
+                        logs.append(f"{target_cidr}: no hosts found on attempt {attempt + 1}, retrying…")
+                        await asyncio.sleep(2 ** attempt)
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt < retry_count:
+                        logs.append(f"{target_cidr}: error on attempt {attempt + 1} ({exc}), retrying…")
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        logs.append(f"{target_cidr}: failed after {retry_count + 1} attempts: {exc}")
+
             responsive_hosts = sorted({item["ip"] for item in ping_results if item.get("ip")})
             if mode == "discovery":
                 hosts = responsive_hosts
             else:
                 hosts = responsive_hosts or hosts_for_cidr(target_cidr)
+
             scan_ports = DISCOVERY_PORTS if mode == "discovery" else ports
-            port_results = await asyncio.to_thread(run_port_scan, hosts, scan_ports, mode != "discovery") if hosts else []
+            port_results = await asyncio.to_thread(
+                run_port_scan, hosts, scan_ports, mode != "discovery", discovery_timeout_s
+            ) if hosts else []
+
             ambient_for_subnet = []
             target_net = ipaddress.ip_network(target_cidr, strict=False)
             for ip, item in ambient_results.items():
@@ -1122,9 +1148,11 @@ async def run_scan(scan_run_id: str, network_id: str | None, mode: str, cidr: st
                         ambient_for_subnet.append(item)
                 except ValueError:
                     pass
+
             results = merge_results(ping_results, port_results, ambient_for_subnet)
             if mode in {"discovery", "service", "deep"}:
                 results = await asyncio.gather(*(asyncio.to_thread(enrich_device_item, item) for item in results))
+
             valid_results = [item for item in results if has_positive_device_evidence(item)]
             dropped = len(results) - len(valid_results)
             if dropped:
@@ -1132,19 +1160,28 @@ async def run_scan(scan_run_id: str, network_id: str | None, mode: str, cidr: st
             for item in valid_results:
                 upsert_device(item, scan_run_id, str(network["_id"]), "scheduled" if job_id else "manual")
             result_count += len(valid_results)
-            logs.append(f"{target_cidr}: {len(valid_results)} responsive devices")
-            update_scan_job(job_id, status="running", current_scan_id=scan_run_id, progress=min(99, progress + 20), message=logs[-1], last_result_count=len(valid_results))
+            logs.append(f"{target_cidr}: {len(valid_results)} responsive devices found")
+            update_scan_run(scan_run_id, "running", progress, logs[-1], logs)
+            update_scan_job(job_id, status="running", current_scan_id=scan_run_id,
+                            progress=min(99, progress + 20), message=logs[-1],
+                            last_result_count=len(valid_results))
+
         final_status = "completed"
-        final_message = "Scan completed"
+        final_message = f"Scan completed – {result_count} devices"
         update_scan_run(scan_run_id, "completed", 100, final_message, logs)
-        audit("scan.completed", resource_type="scan_run", resource_id=scan_run_id, details={"mode": mode, "devices": result_count})
+        audit("scan.completed", resource_type="scan_run", resource_id=scan_run_id,
+              details={"mode": mode, "devices": result_count})
+
     except Exception as exc:
         final_status = "failed"
         final_message = str(exc)
         logs.append(f"ERROR: {exc}")
         update_scan_run(scan_run_id, "failed", 100, final_message, logs)
-        update_scan_job(job_id, status="failed", current_scan_id=scan_run_id, progress=100, message=final_message, last_error=final_message)
-        audit("scan.failed", resource_type="scan_run", resource_id=scan_run_id, details={"mode": mode, "error": str(exc)})
+        update_scan_job(job_id, status="failed", current_scan_id=scan_run_id,
+                        progress=100, message=final_message, last_error=final_message)
+        audit("scan.failed", resource_type="scan_run", resource_id=scan_run_id,
+              details={"mode": mode, "error": str(exc)})
+
     finally:
         if job_id:
             interval = settings.discovery_interval_seconds
@@ -1153,7 +1190,12 @@ async def run_scan(scan_run_id: str, network_id: str | None, mode: str, cidr: st
                 interval = int((network or {}).get("discovery_interval_seconds") or interval)
             next_due = now() + timedelta(seconds=interval)
             terminal_status = "idle" if final_status == "completed" else "failed"
-            mongo().scan_jobs.update_one({"_id": oid(job_id)}, {"$set": {"status": terminal_status, "current_scan_id": None, "progress": 100, "message": final_message, "last_finished_at": now(), "last_result_count": result_count, "priority": 0, "next_due_at": next_due}})
+            mongo().scan_jobs.update_one(
+                {"_id": oid(job_id)},
+                {"$set": {"status": terminal_status, "current_scan_id": None, "progress": 100,
+                           "message": final_message, "last_finished_at": now(),
+                           "last_result_count": result_count, "priority": 0, "next_due_at": next_due}},
+            )
 
 
 class ScannerScheduler:
@@ -1179,10 +1221,16 @@ class ScannerScheduler:
                     continue
                 network = mongo().networks.find_one({"_id": oid(reserved["network_id"]), "is_active": True})
                 if not network:
-                    update_scan_job(str(reserved["_id"]), status="skipped", progress=0, message="Network inactive", current_scan_id=None)
+                    update_scan_job(str(reserved["_id"]), status="skipped", progress=0,
+                                    message="Network inactive", current_scan_id=None)
                     continue
-                scan_id = create_scan_run("discovery", str(network["_id"]), cidr=reserved["cidr"], job_id=str(reserved["_id"]))
-                update_scan_job(str(reserved["_id"]), current_scan_id=scan_id, progress=1, message=f"Started {reserved['cidr']}")
-                task = asyncio.create_task(run_scan(scan_id, str(network["_id"]), "discovery", cidr=reserved["cidr"], job_id=str(reserved["_id"])))
+                scan_id = create_scan_run("discovery", str(network["_id"]),
+                                          cidr=reserved["cidr"], job_id=str(reserved["_id"]))
+                update_scan_job(str(reserved["_id"]), current_scan_id=scan_id, progress=1,
+                                message=f"Started {reserved['cidr']}")
+                task = asyncio.create_task(
+                    run_scan(scan_id, str(network["_id"]), "discovery",
+                             cidr=reserved["cidr"], job_id=str(reserved["_id"]))
+                )
                 self.tasks.add(task)
                 task.add_done_callback(self.tasks.discard)

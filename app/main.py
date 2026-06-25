@@ -15,10 +15,14 @@ from pymongo import DESCENDING
 from .auth import audit, create_api_client, create_session, current_principal, hash_password, require_scope, verify_password
 from .config import settings
 from .db import bootstrap, ensure_scan_jobs_for_network, list_docs, mongo, now, oid, to_jsonable
-from .scanner import create_scan_run, run_scan, sync_identity_source, run_snmpwalk
+from .scanner import (
+    create_scan_run, run_scan, sync_identity_source, run_snmpwalk,
+    reset_failed_scan_jobs, reset_single_scan_job,
+    DEFAULT_DISCOVERY_TIMEOUT_S, DEFAULT_TCP_PROBE_TIMEOUT_MS, DEFAULT_RETRY_COUNT, DEFAULT_RATE_LIMIT,
+)
 from .secrets import encrypt_secret_fields, decrypt_secret_fields, mask_credential
 
-app = FastAPI(title="Network Inventory Scanner", version="4.0.0")
+app = FastAPI(title="Network Inventory Scanner", version="4.1.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -61,6 +65,11 @@ class ScanRequest(BaseModel):
     network_id: str | None = None
     profile_id: str | None = None
     cidr: str | None = None
+    # Scan tuning — all optional, fall back to server defaults
+    discovery_timeout_s: int | None = None   # nmap per-host timeout in seconds
+    tcp_timeout_ms: int | None = None        # fallback TCP connect timeout in ms
+    retry_count: int | None = None           # how many times to retry a failed subnet
+    rate_limit: int | None = None            # target packets/min (informational, stored in options)
 
 
 class ApiClientPayload(BaseModel):
@@ -208,7 +217,8 @@ def scan_doc(scan_id: str) -> dict[str, Any]:
 def global_settings() -> dict[str, Any]:
     row = mongo().system_settings.find_one({"key": "global"})
     if not row:
-        row = {"key": "global", "app_name": settings.app_name, "timezone": settings.timezone_name, "setup_completed": False, "created_at": now(), "updated_at": now()}
+        row = {"key": "global", "app_name": settings.app_name, "timezone": settings.timezone_name,
+               "setup_completed": False, "created_at": now(), "updated_at": now()}
         mongo().system_settings.insert_one(row)
     return row
 
@@ -230,7 +240,6 @@ async def startup() -> None:
     bootstrap()
     from .scanner import ScannerScheduler
     import asyncio
-
     global scheduler
     scheduler = ScannerScheduler()
     asyncio.create_task(scheduler.start())
@@ -240,16 +249,17 @@ async def startup() -> None:
 async def health() -> dict[str, Any]:
     db = mongo()
     return {
-        "status": "ok",
-        "storage": "mongodb",
-        "database": db.name,
-        "timezone": settings.timezone_name,
-        "server_time": now().isoformat(),
+        "status": "ok", "storage": "mongodb", "database": db.name,
+        "timezone": settings.timezone_name, "server_time": now().isoformat(),
         "devices": db.devices.count_documents({}),
         "scan_jobs": db.scan_jobs.count_documents({}),
+        "defaults": {
+            "discovery_timeout_s": DEFAULT_DISCOVERY_TIMEOUT_S,
+            "tcp_timeout_ms": DEFAULT_TCP_PROBE_TIMEOUT_MS,
+            "retry_count": DEFAULT_RETRY_COUNT,
+            "rate_limit": DEFAULT_RATE_LIMIT,
+        },
     }
-
-
 
 
 @app.get("/api/v1/setup/status")
@@ -276,7 +286,12 @@ async def setup_bootstrap(payload: SetupBootstrapPayload, request: Request) -> d
     if payload.default_network:
         existing = mongo().networks.find_one({"cidr": payload.default_network})
         if not existing:
-            result = mongo().networks.insert_one({"name": payload.default_network, "cidr": payload.default_network, "is_active": True, "excludes": [], "discovery_interval_seconds": 120, "deep_scan_interval_minutes": 360, "rate_limit_per_minute": 600, "scan_window": None, "created_at": now(), "updated_at": now()})
+            result = mongo().networks.insert_one({
+                "name": payload.default_network, "cidr": payload.default_network,
+                "is_active": True, "excludes": [], "discovery_interval_seconds": 120,
+                "deep_scan_interval_minutes": 360, "rate_limit_per_minute": 600,
+                "scan_window": None, "created_at": now(), "updated_at": now(),
+            })
             ensure_scan_jobs_for_network(mongo().networks.find_one({"_id": result.inserted_id}))
     mongo().system_settings.update_one({"key": "global"}, {"$set": {"setup_completed": True, "updated_at": now()}}, upsert=True)
     audit("setup.bootstrap", request=request, details={"created_user": created_user, "default_network": payload.default_network})
@@ -310,9 +325,19 @@ async def dashboard(_: dict[str, Any] = Depends(require_scope("assets.read"))) -
         "running_scans": db.scan_runs.count_documents({"status": "running"}),
         "scan_jobs": db.scan_jobs.count_documents({}),
     }
+    # Category breakdown for dashboard chart
+    pipeline = [{"$group": {"_id": "$category", "count": {"$sum": 1}}}]
+    category_counts = {doc["_id"] or "unknown": doc["count"] for doc in db.devices.aggregate(pipeline)}
+
     recent_devices = [normalize_device(doc) for doc in db.devices.find({}).sort("last_seen_at", DESCENDING).limit(10)]
-    recent_scans = [to_jsonable(doc) for doc in db.scan_runs.find({}).sort("created_at", DESCENDING).limit(10)]
-    return {"counts": counts, "recent_assets": recent_devices, "recent_devices": recent_devices, "recent_scans": recent_scans}
+    recent_scans = [normalize_scan(doc) for doc in db.scan_runs.find({}).sort("created_at", DESCENDING).limit(10)]
+    return {
+        "counts": counts,
+        "category_counts": category_counts,
+        "recent_assets": recent_devices,
+        "recent_devices": recent_devices,
+        "recent_scans": recent_scans,
+    }
 
 
 @app.get("/api/v1/networks")
@@ -426,8 +451,6 @@ async def list_scans(_: dict[str, Any] = Depends(require_scope("scan.read"))) ->
     return [normalize_scan(row) for row in mongo().scan_runs.find({}).sort("created_at", DESCENDING).limit(150)]
 
 
-
-
 @app.get("/api/v1/scan-jobs")
 async def list_scan_jobs(_: dict[str, Any] = Depends(require_scope("scan.read"))) -> list[dict[str, Any]]:
     rows = []
@@ -449,47 +472,118 @@ async def list_scan_jobs(_: dict[str, Any] = Depends(require_scope("scan.read"))
     return rows
 
 
+@app.post("/api/v1/scan-jobs/reset-failed")
+async def reset_failed_jobs(request: Request, principal: dict[str, Any] = Depends(require_scope("scan.write"))) -> dict[str, Any]:
+    """Reset all failed scan jobs so they will be picked up on the next scheduler tick."""
+    count = reset_failed_scan_jobs()
+    audit("scan_job.reset_failed", principal, request, details={"count": count})
+    return {"reset": count, "message": f"{count} jobs zurückgesetzt"}
+
+
+@app.post("/api/v1/scan-jobs/{job_id}/reset")
+async def reset_scan_job(job_id: str, request: Request, principal: dict[str, Any] = Depends(require_scope("scan.write"))) -> dict[str, Any]:
+    """Reset a single scan job to queued state."""
+    job = mongo().scan_jobs.find_one({"_id": oid(job_id)})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    updated = reset_single_scan_job(job_id)
+    audit("scan_job.reset", principal, request, "scan_job", job_id, {"cidr": job.get("cidr")})
+    return to_jsonable(updated)
+
+
+@app.post("/api/v1/scan-jobs/{job_id}/trigger-now")
+async def trigger_job_now(job_id: str, background: BackgroundTasks, request: Request,
+                           principal: dict[str, Any] = Depends(require_scope("scan.write"))) -> dict[str, Any]:
+    """Immediately trigger a specific /24 scan job without waiting for its schedule."""
+    from pymongo import ReturnDocument as RD
+    job = mongo().scan_jobs.find_one({"_id": oid(job_id)})
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") == "running":
+        raise HTTPException(status_code=409, detail="Job is already running")
+    reserved = mongo().scan_jobs.find_one_and_update(
+        {"_id": oid(job_id), "status": {"$ne": "running"}},
+        {"$set": {"status": "running", "next_due_at": now(), "message": "Triggered manually", "updated_at": now()}},
+        return_document=RD.AFTER,
+    )
+    if not reserved:
+        raise HTTPException(status_code=409, detail="Job could not be reserved")
+    network = mongo().networks.find_one({"_id": oid(reserved["network_id"]), "is_active": True})
+    if not network:
+        mongo().scan_jobs.update_one({"_id": oid(job_id)}, {"$set": {"status": "skipped", "message": "Network inactive"}})
+        raise HTTPException(status_code=400, detail="Network is inactive")
+    scan_id = create_scan_run("discovery", str(network["_id"]), cidr=reserved["cidr"], job_id=str(reserved["_id"]))
+    background.add_task(run_scan, scan_id, str(network["_id"]), "discovery",
+                        cidr=reserved["cidr"], job_id=str(reserved["_id"]))
+    audit("scan_job.trigger", principal, request, "scan_job", job_id, {"cidr": reserved.get("cidr")})
+    return to_jsonable(mongo().scan_jobs.find_one({"_id": oid(job_id)}))
+
+
 @app.post("/api/v1/scans")
-async def start_scan(payload: ScanRequest, background: BackgroundTasks, request: Request, principal: dict[str, Any] = Depends(require_scope("scan.write"))) -> dict[str, Any]:
+async def start_scan(payload: ScanRequest, background: BackgroundTasks, request: Request,
+                     principal: dict[str, Any] = Depends(require_scope("scan.write"))) -> dict[str, Any]:
     if payload.mode in {"exploit", "bruteforce", "vulnerability", "auth_audit"}:
         profile = mongo().scan_profiles.find_one({"_id": oid(payload.profile_id), "is_enabled": True}) if payload.profile_id else None
         if not profile:
             raise HTTPException(status_code=403, detail="Security profile must be explicitly enabled and selected")
-    scan_id = create_scan_run(payload.mode, payload.network_id, payload.profile_id, principal["type"], principal["id"], payload.cidr)
+
+    # Build options dict from payload
+    options: dict[str, Any] = {}
+    if payload.discovery_timeout_s is not None:
+        options["discovery_timeout_s"] = payload.discovery_timeout_s
+    if payload.tcp_timeout_ms is not None:
+        options["tcp_timeout_ms"] = payload.tcp_timeout_ms
+    if payload.retry_count is not None:
+        options["retry_count"] = payload.retry_count
+    if payload.rate_limit is not None:
+        options["rate_limit"] = payload.rate_limit
+
+    scan_id = create_scan_run(payload.mode, payload.network_id, payload.profile_id,
+                               principal["type"], principal["id"], payload.cidr, options=options)
     audit("scan.start", principal, request, "scan_run", scan_id, payload.model_dump())
-    background.add_task(run_scan, scan_id, payload.network_id, payload.mode, cidr=payload.cidr)
+    background.add_task(run_scan, scan_id, payload.network_id, payload.mode,
+                        cidr=payload.cidr, options=options)
     return scan_doc(scan_id)
 
 
 @app.post("/api/v1/scans/{scan_id}/cancel")
 async def cancel_scan(scan_id: str, request: Request, principal: dict[str, Any] = Depends(require_scope("scan.write"))) -> dict[str, Any]:
-    mongo().scan_runs.update_one({"_id": oid(scan_id), "status": {"$in": ["queued", "running", "paused"]}}, {"$set": {"status": "cancelled", "finished_at": now(), "message": "Cancelled by API"}})
+    mongo().scan_runs.update_one(
+        {"_id": oid(scan_id), "status": {"$in": ["queued", "running", "paused"]}},
+        {"$set": {"status": "cancelled", "finished_at": now(), "message": "Cancelled by API"}},
+    )
     audit("scan.cancel", principal, request, "scan_run", scan_id)
     return scan_doc(scan_id)
 
 
 @app.post("/api/v1/scans/{scan_id}/pause")
 async def pause_scan(scan_id: str, request: Request, principal: dict[str, Any] = Depends(require_scope("scan.write"))) -> dict[str, Any]:
-    mongo().scan_runs.update_one({"_id": oid(scan_id), "status": "running"}, {"$set": {"status": "paused", "message": "Paused by API"}})
+    mongo().scan_runs.update_one({"_id": oid(scan_id), "status": "running"},
+                                  {"$set": {"status": "paused", "message": "Paused by API"}})
     audit("scan.pause", principal, request, "scan_run", scan_id)
     return scan_doc(scan_id)
 
 
 @app.post("/api/v1/scans/{scan_id}/resume")
 async def resume_scan(scan_id: str, request: Request, principal: dict[str, Any] = Depends(require_scope("scan.write"))) -> dict[str, Any]:
-    mongo().scan_runs.update_one({"_id": oid(scan_id), "status": "paused"}, {"$set": {"status": "running", "message": "Resumed by API"}})
+    mongo().scan_runs.update_one({"_id": oid(scan_id), "status": "paused"},
+                                  {"$set": {"status": "running", "message": "Resumed by API"}})
     audit("scan.resume", principal, request, "scan_run", scan_id)
     return scan_doc(scan_id)
 
 
 @app.post("/api/v1/scans/{scan_id}/rerun")
-async def rerun_scan(scan_id: str, background: BackgroundTasks, request: Request, principal: dict[str, Any] = Depends(require_scope("scan.write"))) -> dict[str, Any]:
+async def rerun_scan(scan_id: str, background: BackgroundTasks, request: Request,
+                     principal: dict[str, Any] = Depends(require_scope("scan.write"))) -> dict[str, Any]:
     old = mongo().scan_runs.find_one({"_id": oid(scan_id)})
     if not old:
         raise HTTPException(status_code=404, detail="Scan not found")
-    new_id = create_scan_run(old.get("mode"), old.get("network_id"), old.get("profile_id"), principal["type"], principal["id"], old.get("cidr"))
+    options = old.get("options") or {}
+    new_id = create_scan_run(old.get("mode"), old.get("network_id"), old.get("profile_id"),
+                              principal["type"], principal["id"], old.get("cidr"), options=options)
     audit("scan.rerun", principal, request, "scan_run", new_id, {"source_scan_id": scan_id})
-    background.add_task(run_scan, new_id, old.get("network_id"), old.get("mode"), cidr=old.get("cidr"))
+    background.add_task(run_scan, new_id, old.get("network_id"), old.get("mode"),
+                        cidr=old.get("cidr"), options=options)
     return scan_doc(new_id)
 
 
@@ -501,7 +595,7 @@ async def get_scan(scan_id: str, _: dict[str, Any] = Depends(require_scope("scan
 @app.get("/api/v1/scans/{scan_id}/logs")
 async def get_scan_logs(scan_id: str, _: dict[str, Any] = Depends(require_scope("scan.read"))) -> dict[str, Any]:
     row = scan_doc(scan_id)
-    return {"logs": row.get("logs") or []}
+    return {"logs": row.get("logs") or [], "status": row.get("status"), "progress": row.get("progress")}
 
 
 @app.get("/api/v1/devices/search")
@@ -510,7 +604,8 @@ async def search_devices(q: str = "", _: dict[str, Any] = Depends(require_scope(
 
 
 @app.get("/api/v1/devices")
-async def list_devices(q: str = "", category: str | None = None, status: str | None = None, _: dict[str, Any] = Depends(require_scope("assets.read"))) -> list[dict[str, Any]]:
+async def list_devices(q: str = "", category: str | None = None, status: str | None = None,
+                        _: dict[str, Any] = Depends(require_scope("assets.read"))) -> list[dict[str, Any]]:
     query = regex_query(q)
     if category:
         query["category"] = category
@@ -531,7 +626,9 @@ async def get_device(device_id: str, _: dict[str, Any] = Depends(require_scope("
     observations = [to_jsonable(row) for row in mongo().observations.find({"device_id": doc["device_id"]}).sort("observed_at", DESCENDING).limit(500)]
     item["recent_observations"] = observations
     item["timeline"] = observations
-    item["ip_history"] = [to_jsonable(row) for row in mongo().observations.find({"device_id": doc["device_id"], "ip": {"$ne": None}}, {"ip": 1, "observed_at": 1, "source": 1, "events": 1}).sort("observed_at", DESCENDING).limit(500)]
+    item["ip_history"] = [to_jsonable(row) for row in mongo().observations.find(
+        {"device_id": doc["device_id"], "ip": {"$ne": None}}, {"ip": 1, "observed_at": 1, "source": 1, "events": 1}
+    ).sort("observed_at", DESCENDING).limit(500)]
     item["findings"] = list_docs("findings", {"device_id": doc["device_id"]}, sort=[("last_seen_at", DESCENDING)], limit=200)
     return item
 
@@ -547,7 +644,8 @@ async def device_observations(device_id: str, _: dict[str, Any] = Depends(requir
 
 
 @app.patch("/api/v1/devices/{device_id}")
-async def update_device(device_id: str, payload: DeviceUpdate, request: Request, principal: dict[str, Any] = Depends(require_scope("assets.write"))) -> dict[str, Any]:
+async def update_device(device_id: str, payload: DeviceUpdate, request: Request,
+                         principal: dict[str, Any] = Depends(require_scope("assets.write"))) -> dict[str, Any]:
     updates: dict[str, Any] = {"updated_at": now()}
     if payload.category is not None:
         updates["category"] = payload.category
@@ -575,7 +673,8 @@ async def get_asset(device_id: str, principal: dict[str, Any] = Depends(require_
 
 
 @app.patch("/api/v1/assets/{device_id}")
-async def update_asset(device_id: str, payload: DeviceUpdate, request: Request, principal: dict[str, Any] = Depends(require_scope("assets.write"))) -> dict[str, Any]:
+async def update_asset(device_id: str, payload: DeviceUpdate, request: Request,
+                        principal: dict[str, Any] = Depends(require_scope("assets.write"))) -> dict[str, Any]:
     return await update_device(device_id, payload, request, principal)
 
 
@@ -584,7 +683,11 @@ async def services(_: dict[str, Any] = Depends(require_scope("assets.read"))) ->
     rows: list[dict[str, Any]] = []
     for device in mongo().devices.find({"services": {"$exists": True, "$ne": []}}).limit(1000):
         for service in device.get("services") or []:
-            rows.append(to_jsonable(service | {"device_id": device["device_id"], "primary_ip": (device.get("current_ips") or [None])[0], "hostname": ((device.get("identifiers") or {}).get("hostnames") or [None])[0]}))
+            rows.append(to_jsonable(service | {
+                "device_id": device["device_id"],
+                "primary_ip": (device.get("current_ips") or [None])[0],
+                "hostname": ((device.get("identifiers") or {}).get("hostnames") or [None])[0],
+            }))
     return rows
 
 
@@ -604,12 +707,14 @@ async def enrichment_summary(_: dict[str, Any] = Depends(require_scope("assets.r
 
 @app.get("/api/v1/findings")
 async def list_findings(q: str = "", _: dict[str, Any] = Depends(require_scope("findings.read"))) -> list[dict[str, Any]]:
-    query = {"$or": [{"title": {"$regex": re.escape(q), "$options": "i"}}, {"device_id": {"$regex": re.escape(q), "$options": "i"}}]} if q else {}
+    query = {"$or": [{"title": {"$regex": re.escape(q), "$options": "i"}},
+                     {"device_id": {"$regex": re.escape(q), "$options": "i"}}]} if q else {}
     return list_docs("findings", query, sort=[("last_seen_at", DESCENDING)], limit=250)
 
 
 @app.patch("/api/v1/findings/{finding_id}")
-async def update_finding(finding_id: str, payload: FindingUpdate, request: Request, principal: dict[str, Any] = Depends(require_scope("findings.write"))) -> dict[str, Any]:
+async def update_finding(finding_id: str, payload: FindingUpdate, request: Request,
+                          principal: dict[str, Any] = Depends(require_scope("findings.write"))) -> dict[str, Any]:
     updates = payload.model_dump(exclude_none=True) | {"updated_at": now()}
     mongo().findings.update_one({"_id": oid(finding_id)}, {"$set": updates})
     audit("finding.update", principal, request, "finding", finding_id, updates)
@@ -625,7 +730,8 @@ async def list_identity_sources(_: dict[str, Any] = Depends(require_scope("confi
 
 
 @app.post("/api/v1/identity-sources")
-async def create_identity_source(payload: IdentitySourcePayload, request: Request, principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
+async def create_identity_source(payload: IdentitySourcePayload, request: Request,
+                                   principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
     doc = payload.model_dump() | {"created_at": now(), "updated_at": now(), "last_sync_at": None}
     result = mongo().identity_sources.insert_one(doc)
     audit("identity_source.create", principal, request, "identity_source", result.inserted_id, payload.model_dump())
@@ -633,7 +739,8 @@ async def create_identity_source(payload: IdentitySourcePayload, request: Reques
 
 
 @app.patch("/api/v1/identity-sources/{source_id}")
-async def update_identity_source(source_id: str, payload: IdentitySourcePayload, request: Request, principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
+async def update_identity_source(source_id: str, payload: IdentitySourcePayload, request: Request,
+                                   principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
     mongo().identity_sources.update_one({"_id": oid(source_id)}, {"$set": payload.model_dump() | {"updated_at": now()}})
     audit("identity_source.update", principal, request, "identity_source", source_id, payload.model_dump())
     row = mongo().identity_sources.find_one({"_id": oid(source_id)})
@@ -643,7 +750,8 @@ async def update_identity_source(source_id: str, payload: IdentitySourcePayload,
 
 
 @app.delete("/api/v1/identity-sources/{source_id}")
-async def delete_identity_source(source_id: str, request: Request, principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
+async def delete_identity_source(source_id: str, request: Request,
+                                   principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
     row = mongo().identity_sources.find_one({"_id": oid(source_id)})
     if not row:
         raise HTTPException(status_code=404, detail="Identity source not found")
@@ -653,7 +761,8 @@ async def delete_identity_source(source_id: str, request: Request, principal: di
 
 
 @app.post("/api/v1/identity-sources/{source_id}/test")
-async def test_identity_source(source_id: str, request: Request, principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
+async def test_identity_source(source_id: str, request: Request,
+                                principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
     row = mongo().identity_sources.find_one({"_id": oid(source_id)})
     if not row:
         raise HTTPException(status_code=404, detail="Identity source not found")
@@ -663,7 +772,8 @@ async def test_identity_source(source_id: str, request: Request, principal: dict
 
 
 @app.post("/api/v1/identity-sources/{source_id}/sync")
-async def sync_identity_source_endpoint(source_id: str, request: Request, principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
+async def sync_identity_source_endpoint(source_id: str, request: Request,
+                                         principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
     row = mongo().identity_sources.find_one({"_id": oid(source_id)})
     if not row:
         raise HTTPException(status_code=404, detail="Identity source not found")
@@ -672,18 +782,17 @@ async def sync_identity_source_endpoint(source_id: str, request: Request, princi
     return {"status": "completed", "result": result}
 
 
-
 @app.get("/api/v1/credentials")
 async def list_credentials(_: dict[str, Any] = Depends(require_scope("config.manage"))) -> list[dict[str, Any]]:
     return [to_jsonable(mask_credential(row)) for row in mongo().credentials.find({}).sort("created_at", DESCENDING)]
 
 
 @app.post("/api/v1/credentials")
-async def create_credential(payload: CredentialPayload, request: Request, principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
+async def create_credential(payload: CredentialPayload, request: Request,
+                              principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
     doc = payload.model_dump(exclude={"secret_fields"}) | {
         "encrypted_secret_fields": encrypt_secret_fields(payload.secret_fields),
-        "created_at": now(),
-        "updated_at": now(),
+        "created_at": now(), "updated_at": now(),
     }
     result = mongo().credentials.insert_one(doc)
     audit("credential.create", principal, request, "credential", result.inserted_id, {"name": payload.name, "type": payload.type})
@@ -691,7 +800,8 @@ async def create_credential(payload: CredentialPayload, request: Request, princi
 
 
 @app.patch("/api/v1/credentials/{credential_id}")
-async def update_credential(credential_id: str, payload: CredentialUpdate, request: Request, principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
+async def update_credential(credential_id: str, payload: CredentialUpdate, request: Request,
+                              principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
     updates = payload.model_dump(exclude_unset=True, exclude={"secret_fields"})
     if payload.secret_fields is not None:
         updates["encrypted_secret_fields"] = encrypt_secret_fields(payload.secret_fields)
@@ -705,14 +815,16 @@ async def update_credential(credential_id: str, payload: CredentialUpdate, reque
 
 
 @app.delete("/api/v1/credentials/{credential_id}")
-async def delete_credential(credential_id: str, request: Request, principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
+async def delete_credential(credential_id: str, request: Request,
+                              principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
     mongo().credentials.update_one({"_id": oid(credential_id)}, {"$set": {"is_active": False, "updated_at": now()}})
     audit("credential.disable", principal, request, "credential", credential_id)
     return {"status": "disabled"}
 
 
 @app.post("/api/v1/credentials/{credential_id}/test")
-async def test_credential(credential_id: str, request: Request, principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
+async def test_credential(credential_id: str, request: Request,
+                           principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
     row = mongo().credentials.find_one({"_id": oid(credential_id), "is_active": True})
     if not row:
         raise HTTPException(status_code=404, detail="Credential not found")
@@ -735,7 +847,8 @@ async def get_system_settings(_: dict[str, Any] = Depends(require_scope("config.
 
 
 @app.patch("/api/v1/system/settings")
-async def update_system_settings(payload: SystemSettingsPayload, request: Request, principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
+async def update_system_settings(payload: SystemSettingsPayload, request: Request,
+                                   principal: dict[str, Any] = Depends(require_scope("config.manage"))) -> dict[str, Any]:
     updates = payload.model_dump(exclude_unset=True) | {"updated_at": now()}
     mongo().system_settings.update_one({"key": "global"}, {"$set": updates}, upsert=True)
     audit("system.update", principal, request, "system_settings", "global", updates)
@@ -743,8 +856,10 @@ async def update_system_settings(payload: SystemSettingsPayload, request: Reques
 
 
 @app.patch("/api/v1/users/{user_id}")
-async def update_user(user_id: str, payload: UserPayload, request: Request, principal: dict[str, Any] = Depends(require_scope("auth.manage"))) -> dict[str, Any]:
-    updates = {"email": payload.email.lower(), "name": payload.name, "role": payload.role, "scopes": payload.scopes, "is_active": payload.is_active, "updated_at": now()}
+async def update_user(user_id: str, payload: UserPayload, request: Request,
+                       principal: dict[str, Any] = Depends(require_scope("auth.manage"))) -> dict[str, Any]:
+    updates = {"email": payload.email.lower(), "name": payload.name, "role": payload.role,
+               "scopes": payload.scopes, "is_active": payload.is_active, "updated_at": now()}
     if payload.password:
         updates["password_hash"] = hash_password(payload.password)
     mongo().users.update_one({"_id": oid(user_id)}, {"$set": updates})
@@ -756,7 +871,8 @@ async def update_user(user_id: str, payload: UserPayload, request: Request, prin
 
 
 @app.delete("/api/v1/users/{user_id}")
-async def disable_user(user_id: str, request: Request, principal: dict[str, Any] = Depends(require_scope("auth.manage"))) -> dict[str, Any]:
+async def disable_user(user_id: str, request: Request,
+                        principal: dict[str, Any] = Depends(require_scope("auth.manage"))) -> dict[str, Any]:
     mongo().users.update_one({"_id": oid(user_id)}, {"$set": {"is_active": False, "updated_at": now()}})
     audit("user.disable", principal, request, "user", user_id)
     return {"status": "disabled"}
@@ -771,7 +887,8 @@ async def list_api_clients(_: dict[str, Any] = Depends(require_scope("auth.manag
 
 
 @app.post("/api/v1/api-clients")
-async def create_client(payload: ApiClientPayload, request: Request, principal: dict[str, Any] = Depends(require_scope("auth.manage"))) -> dict[str, Any]:
+async def create_client(payload: ApiClientPayload, request: Request,
+                         principal: dict[str, Any] = Depends(require_scope("auth.manage"))) -> dict[str, Any]:
     client_id, token = create_api_client(payload.name, payload.scopes)
     audit("api_client.create", principal, request, "api_client", client_id, {"name": payload.name, "scopes": payload.scopes})
     return {"id": client_id, "name": payload.name, "token": token, "scopes": payload.scopes}
@@ -783,11 +900,14 @@ async def list_users(_: dict[str, Any] = Depends(require_scope("auth.manage"))) 
 
 
 @app.post("/api/v1/users")
-async def create_or_update_user(payload: UserPayload, request: Request, principal: dict[str, Any] = Depends(require_scope("auth.manage"))) -> dict[str, Any]:
-    update = {"email": payload.email.lower(), "name": payload.name, "role": payload.role, "scopes": payload.scopes, "is_active": payload.is_active, "updated_at": now()}
+async def create_or_update_user(payload: UserPayload, request: Request,
+                                  principal: dict[str, Any] = Depends(require_scope("auth.manage"))) -> dict[str, Any]:
+    update = {"email": payload.email.lower(), "name": payload.name, "role": payload.role,
+              "scopes": payload.scopes, "is_active": payload.is_active, "updated_at": now()}
     if payload.password:
         update["password_hash"] = hash_password(payload.password)
-    result = mongo().users.update_one({"email": payload.email.lower()}, {"$set": update, "$setOnInsert": {"created_at": now()}}, upsert=True)
+    mongo().users.update_one({"email": payload.email.lower()},
+                              {"$set": update, "$setOnInsert": {"created_at": now()}}, upsert=True)
     user = mongo().users.find_one({"email": payload.email.lower()})
     audit("user.upsert", principal, request, "user", user["_id"], {"email": payload.email, "role": payload.role})
     item = to_jsonable(user)
@@ -809,11 +929,10 @@ async def index() -> FileResponse:
     return FileResponse(WEB_DIR / "index.html")
 
 
-
-
 @app.get("/{page_name}")
 async def app_page(page_name: str) -> FileResponse:
-    allowed = {"dashboard", "devices", "scans", "networks", "profiles", "identity", "credentials", "users", "system", "setup", "findings", "audit"}
+    allowed = {"dashboard", "devices", "scans", "networks", "profiles", "identity",
+                "credentials", "users", "system", "setup", "findings", "audit"}
     if page_name not in allowed:
         raise HTTPException(status_code=404, detail="Not found")
     return FileResponse(WEB_DIR / "index.html")
